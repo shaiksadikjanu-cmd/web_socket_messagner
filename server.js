@@ -1,17 +1,17 @@
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+const wss  = new WebSocket.Server({ port: PORT });
 
-const clients = new Map();      // phone → ws
-const msgQueue = new Map();     // phone → [pending messages]
+const clients  = new Map(); // phone → ws
+const msgQueue = new Map(); // phone → [msgs]
+const lastSeen = new Map(); // phone → timestamp
 
 console.log(`Server running on port ${PORT}`);
 
 wss.on('connection', (ws) => {
   let myPhone = null;
 
-  // Ping client every 25s to keep connection alive
   const pingInterval = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) ws.ping();
   }, 25000);
@@ -19,88 +19,136 @@ wss.on('connection', (ws) => {
   ws.on('message', (data, isBinary) => {
 
     if (isBinary) {
-      const header = data.slice(0, 20).toString('utf8').replace(/\0/g, '').trim();
+      const header = data.slice(0, 20).toString('utf8').replace(/\0/g,'').trim();
       const target = clients.get(header);
-      if (target && target.readyState === WebSocket.OPEN) {
+      if (target && target.readyState === WebSocket.OPEN)
         target.send(data, { binary: true });
-      }
       return;
     }
 
     let msg;
-    try { msg = JSON.parse(data.toString()); }
-    catch { return; }
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
     switch (msg.type) {
 
       case 'register':
         myPhone = msg.phone;
         clients.set(myPhone, ws);
+        lastSeen.set(myPhone, Date.now());
         ws.send(JSON.stringify({ type: 'registered', phone: myPhone }));
-        console.log(`+ Registered: ${myPhone} | Online: ${clients.size}`);
+        console.log(`+ ${myPhone} | online: ${clients.size}`);
 
-        // Deliver any queued messages
+        // Notify contacts this user is now online
+        broadcast(myPhone, { type: 'user_online', phone: myPhone });
+
+        // Deliver queued messages
         if (msgQueue.has(myPhone)) {
-          const pending = msgQueue.get(myPhone);
-          pending.forEach(m => ws.send(JSON.stringify(m)));
+          msgQueue.get(myPhone).forEach(m => ws.send(JSON.stringify(m)));
           msgQueue.delete(myPhone);
-          console.log(`  Delivered ${pending.length} queued msgs to ${myPhone}`);
         }
         break;
 
-      case 'message':
-        const target = clients.get(msg.to);
+      case 'message': {
         const payload = {
-          type: 'message',
-          from: myPhone,
-          text: msg.text,
-          time: Date.now(),
-          id  : msg.id || Date.now().toString()
+          type : 'message',
+          from : myPhone,
+          text : msg.text,
+          time : Date.now(),
+          id   : msg.id || Date.now().toString()
         };
+        const target = clients.get(msg.to);
         if (target && target.readyState === WebSocket.OPEN) {
           target.send(JSON.stringify(payload));
-          // Ack sender
           ws.send(JSON.stringify({ type: 'ack', id: payload.id }));
         } else {
-          // Queue for later delivery (max 50 msgs per user)
-          if (!msgQueue.has(msg.to)) msgQueue.set(msg.to, []);
-          const q = msgQueue.get(msg.to);
-          if (q.length < 50) q.push(payload);
+          enqueue(msg.to, payload);
           ws.send(JSON.stringify({ type: 'queued', id: payload.id }));
         }
         break;
+      }
 
-      case 'file_start':
-        const ft = clients.get(msg.to);
-        if (ft && ft.readyState === WebSocket.OPEN) {
-          ft.send(JSON.stringify({
-            type: 'file_start', from: myPhone,
-            fileName: msg.fileName, fileSize: msg.fileSize, fileType: msg.fileType
+      case 'edit': {
+        const target = clients.get(msg.to);
+        const payload = { type:'edit', from:myPhone, id:msg.id, text:msg.text };
+        if (target && target.readyState === WebSocket.OPEN)
+          target.send(JSON.stringify(payload));
+        break;
+      }
+
+      case 'delete': {
+        const target = clients.get(msg.to);
+        const payload = { type:'delete', from:myPhone, id:msg.id };
+        if (target && target.readyState === WebSocket.OPEN)
+          target.send(JSON.stringify(payload));
+        break;
+      }
+
+      case 'typing': {
+        const target = clients.get(msg.to);
+        if (target && target.readyState === WebSocket.OPEN)
+          target.send(JSON.stringify({ type:'typing', from:myPhone, isTyping:msg.isTyping }));
+        break;
+      }
+
+      case 'get_status': {
+        const online   = clients.has(msg.phone);
+        const lastSeenTime = lastSeen.get(msg.phone) || 0;
+        ws.send(JSON.stringify({
+          type     : 'status',
+          phone    : msg.phone,
+          online   : online,
+          lastSeen : lastSeenTime
+        }));
+        break;
+      }
+
+      case 'file_start': {
+        const target = clients.get(msg.to);
+        if (target && target.readyState === WebSocket.OPEN)
+          target.send(JSON.stringify({
+            type:msg.type, from:myPhone,
+            fileName:msg.fileName, fileSize:msg.fileSize,
+            fileType:msg.fileType, fileId:msg.fileId
           }));
-        }
         break;
+      }
 
-      case 'file_end':
-        const fe = clients.get(msg.to);
-        if (fe && fe.readyState === WebSocket.OPEN) {
-          fe.send(JSON.stringify({ type: 'file_end', from: myPhone }));
-        }
+      case 'file_end': {
+        const target = clients.get(msg.to);
+        if (target && target.readyState === WebSocket.OPEN)
+          target.send(JSON.stringify({ type:'file_end', from:myPhone, fileId:msg.fileId }));
         break;
+      }
     }
   });
 
   ws.on('close', () => {
     clearInterval(pingInterval);
     if (myPhone) {
+      lastSeen.set(myPhone, Date.now());
       clients.delete(myPhone);
-      console.log(`- Disconnected: ${myPhone} | Online: ${clients.size}`);
+      broadcast(myPhone, { type:'user_offline', phone:myPhone, lastSeen:Date.now() });
+      console.log(`- ${myPhone} | online: ${clients.size}`);
     }
   });
 
-  ws.on('error', (err) => console.error('Error:', err.message));
+  ws.on('error', e => console.error('err:', e.message));
 });
 
-// Keep Render alive log every 14 min
+function broadcast(senderPhone, payload) {
+  const data = JSON.stringify(payload);
+  clients.forEach((ws, phone) => {
+    if (phone !== senderPhone && ws.readyState === WebSocket.OPEN)
+      ws.send(data);
+  });
+}
+
+function enqueue(phone, msg) {
+  if (!msgQueue.has(phone)) msgQueue.set(phone, []);
+  const q = msgQueue.get(phone);
+  if (q.length < 50) q.push(msg);
+}
+
 setInterval(() => {
-  console.log(`Heartbeat | Online: ${clients.size} | Queued for: ${msgQueue.size} users`);
+  console.log(`Heartbeat | online:${clients.size} queued:${msgQueue.size}`);
 }, 14 * 60 * 1000);
