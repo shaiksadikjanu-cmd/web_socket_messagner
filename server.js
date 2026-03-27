@@ -3,102 +3,104 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-// Phone number → socket map (our "database")
-const clients = new Map();
+const clients = new Map();      // phone → ws
+const msgQueue = new Map();     // phone → [pending messages]
 
 console.log(`Server running on port ${PORT}`);
 
 wss.on('connection', (ws) => {
   let myPhone = null;
 
+  // Ping client every 25s to keep connection alive
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  }, 25000);
+
   ws.on('message', (data, isBinary) => {
 
-    // ── Binary = file chunk being relayed ──
     if (isBinary) {
-      // First 20 bytes = recipient phone (padded), rest = file chunk
       const header = data.slice(0, 20).toString('utf8').replace(/\0/g, '').trim();
-      const chunk  = data.slice(20);
       const target = clients.get(header);
       if (target && target.readyState === WebSocket.OPEN) {
-        target.send(data, { binary: true }); // relay raw to recipient
+        target.send(data, { binary: true });
       }
       return;
     }
 
-    // ── Text = JSON control message ──
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      ws.send(JSON.stringify({ type: 'error', text: 'Invalid JSON' }));
-      return;
-    }
+    try { msg = JSON.parse(data.toString()); }
+    catch { return; }
 
     switch (msg.type) {
 
-      // Client registers its phone number
       case 'register':
         myPhone = msg.phone;
         clients.set(myPhone, ws);
         ws.send(JSON.stringify({ type: 'registered', phone: myPhone }));
-        console.log(`Registered: ${myPhone} | Total online: ${clients.size}`);
+        console.log(`+ Registered: ${myPhone} | Online: ${clients.size}`);
+
+        // Deliver any queued messages
+        if (msgQueue.has(myPhone)) {
+          const pending = msgQueue.get(myPhone);
+          pending.forEach(m => ws.send(JSON.stringify(m)));
+          msgQueue.delete(myPhone);
+          console.log(`  Delivered ${pending.length} queued msgs to ${myPhone}`);
+        }
         break;
 
-      // Client sends a text message to another phone
       case 'message':
         const target = clients.get(msg.to);
+        const payload = {
+          type: 'message',
+          from: myPhone,
+          text: msg.text,
+          time: Date.now(),
+          id  : msg.id || Date.now().toString()
+        };
         if (target && target.readyState === WebSocket.OPEN) {
-          target.send(JSON.stringify({
-            type    : 'message',
-            from    : myPhone,
-            text    : msg.text,
-            time    : Date.now()
-          }));
+          target.send(JSON.stringify(payload));
+          // Ack sender
+          ws.send(JSON.stringify({ type: 'ack', id: payload.id }));
         } else {
-          ws.send(JSON.stringify({ type: 'offline', phone: msg.to }));
+          // Queue for later delivery (max 50 msgs per user)
+          if (!msgQueue.has(msg.to)) msgQueue.set(msg.to, []);
+          const q = msgQueue.get(msg.to);
+          if (q.length < 50) q.push(payload);
+          ws.send(JSON.stringify({ type: 'queued', id: payload.id }));
         }
         break;
 
-      // File transfer start signal
       case 'file_start':
-        const tgt = clients.get(msg.to);
-        if (tgt && tgt.readyState === WebSocket.OPEN) {
-          tgt.send(JSON.stringify({
-            type     : 'file_start',
-            from     : myPhone,
-            fileName : msg.fileName,
-            fileSize : msg.fileSize,
-            fileType : msg.fileType
+        const ft = clients.get(msg.to);
+        if (ft && ft.readyState === WebSocket.OPEN) {
+          ft.send(JSON.stringify({
+            type: 'file_start', from: myPhone,
+            fileName: msg.fileName, fileSize: msg.fileSize, fileType: msg.fileType
           }));
-        } else {
-          ws.send(JSON.stringify({ type: 'offline', phone: msg.to }));
         }
         break;
 
-      // File transfer done signal
       case 'file_end':
-        const t2 = clients.get(msg.to);
-        if (t2 && t2.readyState === WebSocket.OPEN) {
-          t2.send(JSON.stringify({ type: 'file_end', from: myPhone }));
+        const fe = clients.get(msg.to);
+        if (fe && fe.readyState === WebSocket.OPEN) {
+          fe.send(JSON.stringify({ type: 'file_end', from: myPhone }));
         }
         break;
-
-      default:
-        ws.send(JSON.stringify({ type: 'error', text: 'Unknown type' }));
     }
   });
 
-  // Clean up when client disconnects
   ws.on('close', () => {
+    clearInterval(pingInterval);
     if (myPhone) {
       clients.delete(myPhone);
-      console.log(`Disconnected: ${myPhone} | Total online: ${clients.size}`);
+      console.log(`- Disconnected: ${myPhone} | Online: ${clients.size}`);
     }
   });
 
-  ws.on('error', (err) => console.error('Socket error:', err.message));
+  ws.on('error', (err) => console.error('Error:', err.message));
 });
-// Keep Render free tier alive — ping every 14 minutes
+
+// Keep Render alive log every 14 min
 setInterval(() => {
-  console.log(`Alive | clients online: ${clients.size}`);
+  console.log(`Heartbeat | Online: ${clients.size} | Queued for: ${msgQueue.size} users`);
 }, 14 * 60 * 1000);
