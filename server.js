@@ -98,3 +98,7 @@ wss.on('connection', (ws) => {
 
   ws.on('error', (err) => console.error('Socket error:', err.message));
 });
+// Keep Render free tier alive — ping every 14 minutes
+setInterval(() => {
+  console.log(`Alive | clients online: ${clients.size}`);
+}, 14 * 60 * 1000);
